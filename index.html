@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Séquenceur granulaire néo-math</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>body{background:#0a0a0a;margin:0}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useRef, useState, useEffect, useMemo } = React;
+
+const NOTES = ["Do", "Do#", "Ré", "Ré#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si"];
+const STEPS = 16;
+const ROWS = 24; // deux octaves : Do3 .. Si4 (MIDI 48..71)
+const BAND_LABELS = ["Basses < 200 Hz", "Médiums 200–2000 Hz", "Aigus > 2000 Hz"];
+
+/* Accords messianiques (index de rangeligne = ½ tons au-dessus de Do3) */
+const CHORD_SETS = {
+  regard: {
+    label: "Messiaen — Regard du Père (fa♯ majeur, 3 accords)",
+    chords: [
+      { s: 0, rows: [6, 10, 13, 15, 18] },   // Fa#3 La#3 Do#4 Ré#4(6te ajoutée) Fa#4
+      { s: 5, rows: [6, 11, 13, 16, 18] },   // Fa#3 Si3 Do#4 Mi4 Fa#4
+      { s: 10, rows: [3, 6, 13, 18, 22] },   // Ré#3 Fa#3 Do#4 Fa#4 La#4
+      { s: 15, rows: [6, 10, 13, 15, 18] },  // reprise feutrée du 1er
+    ],
+  },
+  merle: {
+    label: "Messiaen — Le Merle Bleu (4 accords, évocation)",
+    chords: [
+      { s: 0, rows: [6, 13, 18, 20] },   // Fa#3 Do#4 Fa#4 Sol#4 — halo bleu
+      { s: 4, rows: [6, 14, 17, 21] },   // Fa#3 Ré4 Fa4 La4 — mer de Mi-jeudi
+      { s: 8, rows: [6, 11, 16, 20] },   // Fa#3 Si3 Mi4 Sol#4 — reflets
+      { s: 12, rows: [6, 10, 15, 20] },  // Fa#3 La#3 Ré#4 Sol#4 — ressac
+    ],
+  },
+};
+
+function gridFromChords(chords) {
+  const g = Array.from({ length: STEPS }, () => Array(ROWS).fill(false));
+  for (const c of chords) for (const r of c.rows) g[c.s][r] = true;
+  return g;
+}
+
+/* ---------- Mini-compilateur de formules ---------- */
+function compileFormula(src) {
+  const s = String(src || "").replace(/\s+/g, "");
+  if (!s) return null;
+  let pos = 0;
+  const peek = () => s[pos];
+  function parseExpr() {
+    let v = parseTerm();
+    while (peek() === "+" || peek() === "-") {
+      const op = s[pos++];
+      const r = parseTerm();
+      const l = v;
+      v = (x) => (op === "+" ? l(x) + r(x) : l(x) - r(x));
+    }
+    return v;
+  }
+  function parseTerm() {
+    let v = parseUnary();
+    while (peek() === "*" || peek() === "/" || peek() === "%") {
+      const op = s[pos++];
+      const r = parseUnary();
+      const l = v;
+      v = (x) => {
+        const b = r(x);
+        if (op === "*") return l(x) * b;
+        if (b === 0) return 0;
+        return op === "/" ? l(x) / b : l(x) % b;
+      };
+    }
+    return v;
+  }
+  function parseUnary() {
+    if (peek() === "-") { pos++; const r = parseUnary(); return (x) => -r(x); }
+    if (peek() === "+") { pos++; return parseUnary(); }
+    return parsePow();
+  }
+  function parsePow() {
+    const b = parseAtom();
+    if (peek() === "^") { pos++; const e = parseUnary(); return (x) => Math.pow(b(x), e(x)); }
+    return b;
+  }
+  function parseArgs() {
+    const args = [parseExpr()];
+    while (peek() === ",") { pos++; args.push(parseExpr()); }
+    return args;
+  }
+  const F1 = { abs: Math.abs, sin: Math.sin, cos: Math.cos, tan: Math.tan, sqrt: (v) => Math.sqrt(Math.abs(v)), floor: Math.floor, round: Math.round, exp: Math.exp, log: (v) => Math.log(Math.max(1e-9, Math.abs(v))) };
+  function parseAtom() {
+    if (peek() === "(") {
+      pos++;
+      const v = parseExpr();
+      if (peek() === ")") pos++;
+      return v;
+    }
+    const num = /^\d+(\.\d+)?/.exec(s.slice(pos));
+    if (num) { pos += num[0].length; const n = parseFloat(num[0]); return () => n; }
+    const id = /^[a-zA-Z_][a-zA-Z0-9_]*/.exec(s.slice(pos));
+    if (!id) throw new Error("token inattendu");
+    const name = id[0];
+    pos += name.length;
+    if (peek() === "(") {
+      pos++;
+      const args = parseArgs();
+      if (peek() === ")") pos++;
+      if (name === "rnd") return () => Math.random();
+      if (name === "min") return (x) => Math.min(args[0](x), args[1](x));
+      if (name === "max") return (x) => Math.max(args[0](x), args[1](x));
+      if (name === "pow") return (x) => Math.pow(args[0](x), args[1](x));
+      if (F1[name]) { const f = F1[name]; return (x) => f(args[0](x)); }
+      throw new Error("fonction inconnue " + name);
+    }
+    return (x) => (x[name] !== undefined ? x[name] : 0);
+  }
+  try {
+    const f = parseExpr();
+    if (pos !== s.length) return null;
+    f({ t: 0, s: 0, i: 0, b: 0, rot: 1, pi: Math.PI, e: Math.E });
+    return f;
+  } catch (e) {
+    return null;
+  }
+}
+
+/* ---------- Générateurs de sources (mono, renormalisés ensuite) ---------- */
+function makeMonoArray(kind, sr) {
+  const n = Math.floor(sr * 3);
+  const d = new Float32Array(n);
+  if (kind === "pad") {
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      let v = 0;
+      for (let h = 1; h <= 5; h++) v += Math.sin(2 * Math.PI * 110 * h * t + Math.sin(2 * Math.PI * 0.7 * t) * h * 0.35) / h;
+      v += Math.sin(2 * Math.PI * 110.4 * 5 * t) * 0.35;
+      v *= 0.55 + 0.45 * Math.sin(2 * Math.PI * 0.13 * t);
+      d[i] = v * 0.22;
+    }
+  } else if (kind === "bell") {
+    const parts = [[1, 1], [2.76, 0.6], [5.4, 0.35], [8.93, 0.18]];
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      let v = 0;
+      for (const [r, a] of parts) v += Math.sin(2 * Math.PI * 220 * r * t) * a * Math.exp(-1.2 * t * Math.min(r, 4) * 0.5);
+      const fade = Math.min(1, (n - i) / (sr * 0.2));
+      d[i] = v * 0.5 * fade;
+    }
+  } else {
+    let lp = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      lp = lp * 0.965 + (Math.random() * 2 - 1) * 0.035;
+      const lfo = 0.5 + 0.5 * Math.sin(2 * Math.PI * 0.18 * t);
+      d[i] = lp * (0.4 + 1.6 * lfo) * 2.2;
+    }
+  }
+  return d;
+}
+
+/* Décorrèle un peu les deux côtés (léger délai + gain sur R) */
+function stereoize(mono) {
+  const L = mono;
+  const R = new Float32Array(mono.length);
+  const delay = 3;
+  for (let i = 0; i < mono.length; i++) R[i] = (i >= delay ? mono[i - delay] : 0) * 0.95;
+  return { L, R };
+}
+
+/* Sépare un signal en 3 bandes (réjecteurs simples) */
+function bandSplit(x, sr) {
+  const n = x.length;
+  const low = new Float32Array(n), lm = new Float32Array(n), mid = new Float32Array(n), high = new Float32Array(n);
+  const a1 = 1 - Math.exp((-2 * Math.PI * 200) / sr);
+  const a2 = 1 - Math.exp((-2 * Math.PI * 2000) / sr);
+  let y1 = 0, y2 = 0;
+  for (let i = 0; i < n; i++) {
+    y1 += a1 * (x[i] - y1);
+    y2 += a2 * (x[i] - y2);
+    low[i] = y1;
+    lm[i] = y2;
+  }
+  for (let i = 0; i < n; i++) { mid[i] = lm[i] - low[i]; high[i] = x[i] - lm[i]; }
+  return { low, mid, high };
+}
+
+function toBuffer(ctx, arr) {
+  const b = ctx.createBuffer(1, arr.length, ctx.sampleRate);
+  b.getChannelData(0).set(arr);
+  return b;
+}
+
+/* Construit l'ensemble : full + 3 bandes, chacune en mono/L/R */
+function buildBufSet(ctx, monoArr) {
+  const sr = ctx.sampleRate;
+  const { L, R } = stereoize(monoArr);
+  const pack = (m, l, r) => ({ mono: toBuffer(ctx, m), L: toBuffer(ctx, l), R: toBuffer(ctx, r) });
+  const full = pack(monoArr, L, R);
+  const sm = bandSplit(monoArr, sr), sl = bandSplit(L, sr), sb = bandSplit(R, sr);
+  const bands = ["low", "mid", "high"].map((k) => pack(sm[k], sl[k], sb[k]));
+  return { full, bands };
+}
+
+/* ---------- Petits composants UI ---------- */
+function Slider({ label, value, min, max, step, onChange, fmt }) {
+  return (
+    <label className="block">
+      <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+        <span>{label}</span>
+        <span className="text-amber-400 font-mono">{fmt ? fmt(value) : value}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="w-full accent-amber-400" />
+    </label>
+  );
+}
+
+const PRESETS = {
+  tournoyer: { pan: "sin(2*pi*t*rot)", pit: "1 + 0.05*cos(2*pi*t*rot)", rot: 0.15, rate: 16, size: 180, jitter: 0.35, mode: "mono", pads: null, label: "Tournoyer lent" },
+  doppler: { pan: "sin(2*pi*t*rot)", pit: "1 + 0.14*cos(2*pi*t*rot)", rot: 0.6, rate: 30, size: 90, jitter: 0.2, mode: "mono", pads: null, label: "Doppler rapide" },
+  chaos: { pan: "sin(2*pi*t*rot + i*0.7)", pit: "pow(2, floor(rnd()*12)/12)", rot: 0.3, rate: 22, size: 60, jitter: 1, mode: "mono", pads: null, label: "Chaos granulaire" },
+  statique: { pan: "0", pit: "1", rot: 0.1, rate: 24, size: 220, jitter: 0.9, mode: "mono", pads: null, label: "Nappe statique" },
+  tribande: { pan: "sin(2*pi*t*rot)", pit: "1", rot: 0.1, rate: 22, size: 130, jitter: 0.6, mode: "stereo", pads: [{ on: true, type: "gli" }, { on: true, type: "vib" }, { on: true, type: "fx" }], label: "Tri-bande stéréo" },
+};
+
+const DEFAULT_PADS = [
+  { on: false, type: "gli", gain: 1, vibRate: 5, vibCents: 30, gliSemis: 7, gliPeriod: 4, fx: "1 + 0.15*sin(2*pi*t*1.3)" },
+  { on: false, type: "vib", gain: 1, vibRate: 4, vibCents: 12, gliSemis: -5, gliPeriod: 6, fx: "pow(2, floor(rnd()*12)/12)" },
+  { on: false, type: "fx", gain: 1, vibRate: 7, vibCents: 18, gliSemis: 12, gliPeriod: 8, fx: "1 + 0.25*sin(2*pi*b*t)" },
+];
+
+function App() {
+  const [playing, setPlaying] = useState(false);
+  const [bpm, setBpm] = useState(112);
+  const [rate, setRate] = useState(18);
+  const [size, setSize] = useState(140);
+  const [jitter, setJitter] = useState(0.5);
+  const [rot, setRot] = useState(0.2);
+  const [vol, setVol] = useState(0.7);
+  const [panSrc, setPanSrc] = useState("sin(2*pi*t*rot)");
+  const [pitSrc, setPitSrc] = useState("1 + 0.05*cos(2*pi*t*rot)");
+  const [source, setSource] = useState("pad");
+  const [sampleName, setSampleName] = useState("");
+  const [sampleEpoch, setSampleEpoch] = useState(0);
+  const [mode, setMode] = useState("mono");
+  const [song, setSong] = useState("regard");
+  const [pads, setPads] = useState(DEFAULT_PADS);
+  const [uiStep, setUiStep] = useState(-1);
+  const [grid, setGrid] = useState(() => gridFromChords(CHORD_SETS.regard.chords));
+
+  const panFn = useMemo(() => compileFormula(panSrc), [panSrc]);
+  const pitFn = useMemo(() => compileFormula(pitSrc), [pitSrc]);
+  const padFns = useMemo(() => pads.map((p) => (p.type === "fx" ? compileFormula(p.fx) : null)), [pads]);
+
+  const ctxRef = useRef(null);
+  const masterRef = useRef(null);
+  const analyserRef = useRef(null);
+  const sourcesRef = useRef(null); // { pad: bufSet, bell:, noise:, sample: }
+  const bufSetRef = useRef(null);
+  const bufSetEpochRef = useRef(0);
+  const timerRef = useRef(null);
+  const t0Ref = useRef(0);
+  const nextStepRef = useRef(0);
+  const stepRef = useRef(0);
+  const grainIdxRef = useRef(0);
+  const sparksRef = useRef([]);
+  const stepTimesRef = useRef([]);
+
+  const bpmRef = useRef(bpm); bpmRef.current = bpm;
+  const rateRef = useRef(rate); rateRef.current = rate;
+  const sizeRef = useRef(size); sizeRef.current = size;
+  const jitterRef = useRef(jitter); jitterRef.current = jitter;
+  const rotRef = useRef(rot); rotRef.current = rot;
+  const modeRef = useRef(mode); modeRef.current = mode;
+  const gridRef = useRef(grid); gridRef.current = grid;
+  const padsRef = useRef(pads); padsRef.current = pads;
+  const panFnRef = useRef(panFn); panFnRef.current = panFn;
+  const pitFnRef = useRef(pitFn); pitFnRef.current = pitFn;
+  const padFnsRef = useRef(padFns); padFnsRef.current = padFns;
+  const playingRef = useRef(playing); playingRef.current = playing;
+  const sourceRef = useRef(source); sourceRef.current = source;
+
+  const waveRef = useRef(null);
+  const panCvRef = useRef(null);
+
+  /* Sélection de source → jeu de buffers correspondant */
+  useEffect(() => {
+    const map = sourcesRef.current;
+    if (!map) return;
+    bufSetRef.current = map[source] || map.pad;
+    bufSetEpochRef.current++;
+  }, [source, sampleEpoch]);
+
+  useEffect(() => {
+    if (masterRef.current) masterRef.current.gain.value = vol * 0.8;
+  }, [vol]);
+
+  /* Transformation de bande : multiplicateur de hauteur */
+  const bandMult = (pad, fn, V) => {
+    try {
+      if (pad.type === "vib") return Math.pow(2, (pad.vibCents / 1200) * Math.sin(2 * Math.PI * pad.vibRate * V.t));
+      if (pad.type === "gli") {
+        const per = Math.max(0.2, pad.gliPeriod);
+        const frac = ((V.t / per) % 1 + 1) % 1;
+        return Math.pow(2, (pad.gliSemis / 12) * (2 * frac - 1));
+      }
+      if (pad.type === "fx" && fn) {
+        const v = fn(V);
+        return isFinite(v) && v > 0 ? v : 1;
+      }
+    } catch (e) {}
+    return 1;
+  };
+
+  /* Place un grain : buffer → enveloppe de Hann → panner → master */
+  const placeGrain = (ctx, buf, when, ratio, pan, amp, sizeS) => {
+    if (!buf) return;
+    const usable = Math.max(0.05, buf.duration - 0.4);
+    const offset = Math.min(usable, 0.05 + Math.random() * jitterRef.current * usable);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = ratio;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, when);
+    g.gain.linearRampToValueAtTime(amp, when + sizeS / 2);
+    g.gain.linearRampToValueAtTime(0, when + sizeS);
+    const p = ctx.createStereoPanner();
+    p.pan.value = pan;
+    src.connect(g); g.connect(p); p.connect(masterRef.current);
+    src.start(when, offset);
+    src.stop(when + sizeS + 0.02);
+    sparksRef.current.push({ pan, when });
+  };
+
+  const spawnGrain = (when, semi, step, bi) => {
+    const ctx = ctxRef.current;
+    const set = bufSetRef.current;
+    if (!ctx || !set) return;
+    const gi = grainIdxRef.current++;
+    const t = when - t0Ref.current;
+    const V = { t, s: step, i: gi, b: bi, rot: rotRef.current, pi: Math.PI, e: Math.E };
+    const active = padsRef.current.map((p, k) => ({ p, k })).filter((x) => x.p.on);
+    const useFull = active.length === 0;
+    const choice = useFull ? null : active[(Math.random() * active.length) | 0];
+    const bandIdx = choice ? choice.k : -1;
+    const bufs = choice ? set.bands[choice.k] : set.full;
+    let mult = 1, pgain = 1;
+    if (choice) { mult = bandMult(choice.p, padFnsRef.current[choice.k] || null, { ...V, b: choice.k }); pgain = choice.p.gain; }
+    let ratio = Math.pow(2, semi / 12) * mult;
+    if (pitFnRef.current) { try { const v = pitFnRef.current(V); if (v > 0) ratio *= v; } catch (e) {} }
+    ratio = Math.min(16, Math.max(0.02, ratio));
+    const sizeS = Math.max(0.01, sizeRef.current / 1000);
+    const ov = Math.max(1, rateRef.current * sizeS);
+    const amp = Math.min(0.55, 1.4 / Math.sqrt(ov)) * (0.8 + Math.random() * 0.4) * pgain;
+    let pv = Math.random() * 2 - 1;
+    if (panFnRef.current) { try { pv = panFnRef.current(V); } catch (e) {} }
+    pv = Math.max(-1, Math.min(1, pv));
+    if (modeRef.current === "mono") {
+      /* Mixdown → un seul nuage, spatialisé par la formule de pan */
+      placeGrain(ctx, bufs.mono, when, ratio, pv, amp, sizeS);
+    } else {
+      /* Stéréo → deux granularisations indépendantes, une par côté */
+      const w = Math.max(0.2, Math.min(0.95, 0.62 + 0.33 * pv * (rotRef.current > 0.01 ? 1 : pv)));
+      const wt = Math.max(0.2, Math.min(0.95, 0.62 + 0.33 * pv));
+      const a = amp * 0.72;
+      placeGrain(ctx, bufs.L, when, ratio, -wt, a, sizeS);
+      placeGrain(ctx, bufs.R, when, ratio, wt, a, sizeS);
+    }
+  };
+
+  const scheduler = () => {
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+    const stepDur = 60 / bpmRef.current / 4;
+    while (nextStepRef.current < ctx.currentTime + 0.12) {
+      const st = stepRef.current;
+      const when = nextStepRef.current;
+      const rows = gridRef.current[st].map((v, r) => (v ? r : -1)).filter((r) => r >= 0);
+      if (rows.length) {
+        const n = Math.max(1, Math.round(rateRef.current * stepDur));
+        for (let k = 0; k < n; k++) {
+          let t = when + (k + Math.random() * 0.7) / rateRef.current;
+          if (t >= when + stepDur) t = when + Math.random() * stepDur;
+          spawnGrain(t, rows[(Math.random() * rows.length) | 0], st, st);
+        }
+      }
+      stepTimesRef.current.push({ step: st, time: when });
+      if (stepTimesRef.current.length > 64) stepTimesRef.current.shift();
+      nextStepRef.current += stepDur;
+      stepRef.current = (st + 1) % STEPS;
+    }
+    const now = ctx.currentTime;
+    let cur = -1;
+    for (const e of stepTimesRef.current) if (e.time <= now) cur = e.step;
+    setUiStep(cur);
+  };
+
+  const start = async () => {
+    let ctx = ctxRef.current;
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC();
+      ctxRef.current = ctx;
+      const master = ctx.createGain();
+      master.gain.value = vol * 0.8;
+      const an = ctx.createAnalyser();
+      an.fftSize = 2048;
+      master.connect(an);
+      an.connect(ctx.destination);
+      masterRef.current = master;
+      analyserRef.current = an;
+      sourcesRef.current = {
+        pad: buildBufSet(ctx, makeMonoArray("pad", ctx.sampleRate)),
+        bell: buildBufSet(ctx, makeMonoArray("bell", ctx.sampleRate)),
+        noise: buildBufSet(ctx, makeMonoArray("noise", ctx.sampleRate)),
+      };
+      bufSetRef.current = sourcesRef.current[sourceRef.current] || sourcesRef.current.pad;
+    }
+    await ctx.resume();
+    t0Ref.current = ctx.currentTime + 0.06;
+    nextStepRef.current = t0Ref.current;
+    stepRef.current = 0;
+    grainIdxRef.current = 0;
+    stepTimesRef.current = [];
+    timerRef.current = setInterval(scheduler, 25);
+    setPlaying(true);
+  };
+
+  const stop = () => {
+    clearInterval(timerRef.current);
+    timerRef.current = null;
+    if (ctxRef.current) ctxRef.current.suspend();
+    sparksRef.current = [];
+    stepTimesRef.current = [];
+    setUiStep(-1);
+    setPlaying(false);
+  };
+
+  useEffect(() => () => {
+    clearInterval(timerRef.current);
+    if (ctxRef.current) ctxRef.current.close();
+  }, []);
+
+  const loadSample = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    let ctx = ctxRef.current;
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC();
+      ctxRef.current = ctx;
+    }
+    try {
+      const ab = await f.arrayBuffer();
+      const dec = await ctx.decodeAudioData(ab);
+      const lim = Math.min(dec.length, Math.floor(ctx.sampleRate * 60));
+      const chL = dec.getChannelData(0);
+      const chR = dec.numberOfChannels > 1 ? dec.getChannelData(1) : chL;
+      const mono = new Float32Array(lim);
+      for (let i = 0; i < lim; i++) mono[i] = (chL[i] + chR[i]) * 0.5;
+      const set = buildBufSet(ctx, mono);
+      /* écrase L/R par les vrais canaux du fichier */
+      set.full.L.getChannelData(0).set(chL.subarray(0, lim));
+      set.full.R.getChannelData(0).set(chR.subarray(0, lim));
+      const sl = bandSplit(new Float32Array(chL.subarray(0, lim)), ctx.sampleRate);
+      const sb = bandSplit(new Float32Array(chR.subarray(0, lim)), ctx.sampleRate);
+      ["low", "mid", "high"].forEach((k, i2) => {
+        set.bands[i2].L.getChannelData(0).set(sl[k]);
+        set.bands[i2].R.getChannelData(0).set(sb[k]);
+      });
+      if (!sourcesRef.current) sourcesRef.current = {};
+      sourcesRef.current.sample = set;
+      setSampleName(f.name);
+      setSource("sample");
+      setSampleEpoch((x) => x + 1);
+    } catch (err) {
+      setSampleName("format non lisible");
+    }
+  };
+
+  /* Visualiseur : oscilloscope + champ stéréo */
+  useEffect(() => {
+    let raf;
+    const draw = () => {
+      raf = requestAnimationFrame(draw);
+      const cv = waveRef.current;
+      if (cv) {
+        const g = cv.getContext("2d");
+        const W = cv.width, H = cv.height;
+        g.clearRect(0, 0, W, H);
+        g.strokeStyle = "#fbbf24";
+        g.lineWidth = 1.5;
+        g.beginPath();
+        const an = analyserRef.current;
+        if (an && playingRef.current) {
+          const data = new Uint8Array(an.fftSize);
+          an.getByteTimeDomainData(data);
+          for (let x = 0; x < W; x++) {
+            const v = data[Math.floor((x / W) * data.length)] / 128 - 1;
+            const y = H / 2 + v * H * 0.48;
+            if (x === 0) g.moveTo(x, y); else g.lineTo(x, y);
+          }
+        } else {
+          g.moveTo(0, H / 2); g.lineTo(W, H / 2);
+        }
+        g.stroke();
+      }
+      const pc = panCvRef.current;
+      if (pc) {
+        const g = pc.getContext("2d");
+        const W = pc.width, H = pc.height;
+        g.clearRect(0, 0, W, H);
+        const cx = W / 2, cy = H * 0.62, R = Math.min(W, H) * 0.34;
+        g.strokeStyle = "rgba(120,120,130,0.5)";
+        g.lineWidth = 1;
+        g.beginPath(); g.arc(cx, cy, R, Math.PI, 2 * Math.PI); g.stroke();
+        g.fillStyle = "rgba(160,160,170,0.7)";
+        g.font = "10px sans-serif"; g.textAlign = "center";
+        g.fillText("auditeur", cx, cy + 12);
+        g.fillText("G", cx - R - 8, cy); g.fillText("D", cx + R + 8, cy);
+        const ctx = ctxRef.current;
+        const now = ctx ? ctx.currentTime : 0;
+        sparksRef.current = sparksRef.current.filter((s) => now - s.when < 1.2 && now - s.when > -0.2);
+        for (const s of sparksRef.current) {
+          const age = Math.max(0, now - s.when);
+          const a = 1 - age / 1.2;
+          const ang = (s.pan * Math.PI) / 2;
+          const x = cx + Math.sin(ang) * R;
+          const y = cy - Math.cos(ang) * R;
+          g.fillStyle = `rgba(251,191,36,${a.toFixed(3)})`;
+          g.beginPath(); g.arc(x, y, 2 + 3 * a, 0, 2 * Math.PI); g.fill();
+        }
+      }
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  const toggleCell = (s, r) => setGrid((g) => g.map((col, i) => (i === s ? col.map((v, j) => (j === r ? !v : v)) : col)));
+
+  const applyPreset = (p) => {
+    setPanSrc(p.pan); setPitSrc(p.pit); setRot(p.rot); setRate(p.rate); setSize(p.size); setJitter(p.jitter); setMode(p.mode || "mono");
+    if (p.pads) setPads((ps) => ps.map((x, i) => ({ ...x, ...p.pads[i] })));
+  };
+
+  const updatePad = (i, patch) => setPads((ps) => ps.map((p, k) => (k === i ? { ...p, ...patch } : p)));
+
+  const srcBtn = (k, label) => (
+    <button onClick={() => setSource(k)}
+      className={`px-3 py-1.5 rounded-lg text-xs font-medium border ${source === k ? "bg-amber-400 text-black border-amber-400" : "bg-neutral-900 border-neutral-700 text-neutral-300 hover:border-amber-400"}`}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="min-h-screen bg-neutral-950 text-neutral-200 p-4 md:p-6 font-sans">
+      <div className="max-w-5xl mx-auto space-y-5">
+        <header className="flex flex-wrap items-center gap-4 justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-amber-400">🐱 Séquenceur granulaire néo-math</h1>
+            <p className="text-xs text-neutral-500 mt-1">Pas-à-pas sur 2 octaves + granulation mono/stéréo + bandes à fonctions</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="text-right">
+              <div className="text-xs text-neutral-500">tempo</div>
+              <div className="font-mono text-amber-400">{bpm} bpm</div>
+            </div>
+            <input type="range" min="50" max="180" value={bpm} onChange={(e) => setBpm(parseInt(e.target.value))} className="accent-amber-400 w-24" />
+            <button onClick={playing ? stop : start}
+              className={`px-5 py-2.5 rounded-xl font-semibold ${playing ? "bg-red-500 hover:bg-red-400" : "bg-amber-400 hover:bg-amber-300 text-black"}`}>
+              {playing ? "■ Stop" : "▶ Lecture"}
+            </button>
+          </div>
+        </header>
+
+        {/* Grille séquenceur */}
+        <div className="bg-neutral-900 rounded-2xl p-3 border border-neutral-800">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h2 className="text-sm font-semibold text-amber-400">Séquenceur — deux octaves (Do3 → Si4)</h2>
+            <select value={song}
+              onChange={(e) => {
+                const v = e.target.value;
+                setSong(v);
+                if (v !== "libre") setGrid(gridFromChords(CHORD_SETS[v].chords));
+              }}
+              className="bg-neutral-950 border border-neutral-700 rounded-lg text-xs px-2 py-1.5 outline-none focus:border-amber-400">
+              <option value="regard">Messiaen — Regard du Père (3 accords, fa♯ majeur)</option>
+              <option value="merle">Messiaen — Le Merle Bleu (4 accords, évocation)</option>
+              <option value="libre">Grille libre (tes notes)</option>
+            </select>
+          </div>
+          <div className="overflow-x-auto">
+            <div style={{ display: "grid", gridTemplateColumns: `64px repeat(${STEPS}, minmax(26px, 1fr))`, gap: 3, minWidth: 560 }}>
+            {Array.from({ length: ROWS }, (_, k) => ROWS - 1 - k).map((r) => (
+              <React.Fragment key={r}>
+                <div className={`text-[10px] font-mono flex items-center ${r % 12 === 0 ? "text-amber-500 font-bold" : "text-neutral-500"}`}>
+                  {NOTES[r % 12]}{3 + Math.floor(r / 12)}
+                </div>
+                {Array.from({ length: STEPS }, (_, s) => {
+                  const on = grid[s][r];
+                  const here = uiStep === s;
+                  return (
+                    <button key={s} onClick={() => toggleCell(s, r)}
+                      className={`h-5 rounded transition-colors ${on ? "bg-amber-400 hover:bg-amber-300" : "bg-neutral-800 hover:bg-neutral-700"} ${here ? "ring-2 ring-amber-200" : ""}`}
+                    />
+                  );
+                })}
+              </React.Fragment>
+            ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Visualiseurs */}
+        <div className="grid md:grid-cols-2 gap-4">
+          <div className="bg-neutral-900 rounded-2xl p-3 border border-neutral-800">
+            <div className="text-xs text-neutral-500 mb-2">Oscilloscope</div>
+            <canvas ref={waveRef} width={600} height={110} className="w-full" />
+          </div>
+          <div className="bg-neutral-900 rounded-2xl p-3 border border-neutral-800">
+            <div className="text-xs text-neutral-500 mb-2">Champ stéréo (chaque grain = une étincelle)</div>
+            <canvas ref={panCvRef} width={600} height={110} className="w-full" />
+          </div>
+        </div>
+
+        {/* Moteur granulaire */}
+        <div className="bg-neutral-900 rounded-2xl p-4 border border-neutral-800">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+            <h2 className="text-sm font-semibold text-amber-400">Moteur granulaire</h2>
+            <div className="flex rounded-xl overflow-hidden border border-neutral-700 text-xs font-medium">
+              <button onClick={() => setMode("mono")}
+                className={`px-3 py-1.5 ${mode === "mono" ? "bg-amber-400 text-black" : "bg-neutral-900 text-neutral-300 hover:text-amber-300"}`}>
+                Mono mixdown → spatialisation
+              </button>
+              <button onClick={() => setMode("stereo")}
+                className={`px-3 py-1.5 ${mode === "stereo" ? "bg-amber-400 text-black" : "bg-neutral-900 text-neutral-300 hover:text-amber-300"}`}>
+                Stéréo → 2 granularisations
+              </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <Slider label="Densité (grains/s)" value={rate} min={2} max={48} step={1} onChange={setRate} />
+            <Slider label="Taille de grain" value={size} min={20} max={400} step={5} onChange={setSize} fmt={(v) => v + " ms"} />
+            <Slider label="Dispersion de lecture" value={jitter} min={0} max={1} step={0.05} onChange={setJitter} fmt={(v) => Math.round(v * 100) + "%"} />
+            <Slider label="Volume" value={vol} min={0} max={1} step={0.05} onChange={setVol} fmt={(v) => Math.round(v * 100) + "%"} />
+          </div>
+          <p className="text-[11px] text-neutral-500 mt-3">
+            {mode === "mono"
+              ? "Mode mono : le sample est mixdowné, chaque grain est une perche mono placée dans le champ stéréo par la formule de panoramique."
+              : "Mode stéréo : chaque côté (gauche / droite) est granularisé indépendamment, positions et allers-retours différents. La formule de pan module encore la largeur."}
+          </p>
+          <div className="flex flex-wrap items-center gap-2 mt-4">
+            <span className="text-xs text-neutral-500 mr-1">Source :</span>
+            {srcBtn("pad", "Cordes")}
+            {srcBtn("bell", "Cloche")}
+            {srcBtn("noise", "Bruit")}
+            {srcBtn("sample", sampleName ? sampleName.slice(0, 18) : "Ton sample…")}
+            <label className="px-3 py-1.5 rounded-lg text-xs bg-neutral-800 border border-neutral-700 cursor-pointer hover:border-amber-400">
+              Charger un fichier audio
+              <input type="file" accept="audio/*" className="hidden" onChange={loadSample} />
+            </label>
+            {source === "sample" && !sampleName && <span className="text-[11px] text-amber-500">charge un fichier pour activer cette source</span>}
+          </div>
+        </div>
+
+        {/* Pads de sortie par bandes */}
+        <div className="bg-neutral-900 rounded-2xl p-4 border border-neutral-800">
+          <h2 className="text-sm font-semibold text-amber-400 mb-1">Pads de sortie — bandes de fréquences</h2>
+          <p className="text-[11px] text-neutral-500 mb-3">
+            Le son est découpé en trois bandes. Chaque pad applique sa propre transformation de hauteur à sa bande :
+            vibrato, glissando continu, ou n'importe quelle fonction math. Pads tous éteints = bande pleine inchangée.
+          </p>
+          <div className="grid md:grid-cols-3 gap-3">
+            {pads.map((p, i) => (
+              <div key={i} className={`rounded-xl p-3 border ${p.on ? "border-amber-400/60 bg-neutral-950" : "border-neutral-800 bg-neutral-950"}`}>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-semibold">{BAND_LABELS[i]}</span>
+                  <button onClick={() => updatePad(i, { on: !p.on })}
+                    className={`w-10 h-5 rounded-full transition-colors relative ${p.on ? "bg-amber-400" : "bg-neutral-700"}`}>
+                    <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${p.on ? "left-5" : "left-0.5"}`} />
+                  </button>
+                </div>
+                <select value={p.type} onChange={(e) => updatePad(i, { type: e.target.value })}
+                  className="w-full bg-neutral-900 border border-neutral-700 rounded-lg text-xs px-2 py-1.5 mb-2">
+                  <option value="gli">Glissando</option>
+                  <option value="vib">Vibrato</option>
+                  <option value="fx">Formule</option>
+                </select>
+                {p.type === "vib" && (
+                  <div className="space-y-2">
+                    <Slider label="Fréquence" value={p.vibRate} min={0.5} max={12} step={0.1} onChange={(v) => updatePad(i, { vibRate: v })} fmt={(v) => v.toFixed(1) + " Hz"} />
+                    <Slider label="Profondeur" value={p.vibCents} min={1} max={100} step={1} onChange={(v) => updatePad(i, { vibCents: v })} fmt={(v) => v + " cents"} />
+                  </div>
+                )}
+                {p.type === "gli" && (
+                  <div className="space-y-2">
+                    <Slider label="Amplitude" value={p.gliSemis} min={-24} max={24} step={1} onChange={(v) => updatePad(i, { gliSemis: v })} fmt={(v) => v + " ½ tons"} />
+                    <Slider label="Durée du cycle" value={p.gliPeriod} min={0.5} max={16} step={0.5} onChange={(v) => updatePad(i, { gliPeriod: v })} fmt={(v) => v.toFixed(1) + " s"} />
+                  </div>
+                )}
+                {p.type === "fx" && (
+                  <div>
+                    <input value={p.fx} onChange={(e) => updatePad(i, { fx: e.target.value })} spellCheck="false"
+                      className={`w-full font-mono text-[11px] bg-neutral-900 border rounded-lg px-2 py-1.5 mb-1 outline-none ${padFns[i] ? "border-neutral-700 focus:border-amber-400 text-amber-200" : "border-red-500 text-red-300"}`} />
+                    {!padFns[i] && <div className="text-[10px] text-red-400 mb-1">formule invalide → bande inchangée</div>}
+                    <div className="text-[10px] font-mono text-neutral-600">vars : t, s, b, i, rot, pi, e, rnd()…</div>
+                  </div>
+                )}
+                <div className="mt-2">
+                  <Slider label="Gain de bande" value={p.gain} min={0} max={1.5} step={0.05} onChange={(v) => updatePad(i, { gain: v })} fmt={(v) => Math.round(v * 100) + "%"} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Formules mathématiques */}
+        <div className="bg-neutral-900 rounded-2xl p-4 border border-neutral-800">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-amber-400">Transformations mathématiques globales</h2>
+            <div className="flex flex-wrap gap-2">
+              {Object.values(PRESETS).map((p) => (
+                <button key={p.label} onClick={() => applyPreset(p)}
+                  className="px-2.5 py-1 rounded-lg text-[11px] bg-neutral-800 border border-neutral-700 hover:border-amber-400 hover:text-amber-300">
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="grid md:grid-cols-2 gap-4">
+            <div>
+              <div className="text-xs text-neutral-400 mb-1">Panoramique des grains <span className="text-neutral-600">(−1 gauche, +1 droite)</span></div>
+              <input value={panSrc} onChange={(e) => setPanSrc(e.target.value)} spellCheck="false"
+                className={`w-full font-mono text-sm bg-neutral-950 border rounded-lg px-3 py-2 outline-none ${panFn ? "border-neutral-700 focus:border-amber-400 text-amber-200" : "border-red-500 text-red-300"}`} />
+              {!panFn && <div className="text-[11px] text-red-400 mt-1">formule invalide → aléatoire</div>}
+              <div className="text-[10px] font-mono text-neutral-600 mt-1">ex : sin(2*pi*t*rot)</div>
+            </div>
+            <div>
+              <div className="text-xs text-neutral-400 mb-1">Multiplicateur de hauteur global <span className="text-neutral-600">(1 = inchangé)</span></div>
+              <input value={pitSrc} onChange={(e) => setPitSrc(e.target.value)} spellCheck="false"
+                className={`w-full font-mono text-sm bg-neutral-950 border rounded-lg px-3 py-2 outline-none ${pitFn ? "border-neutral-700 focus:border-amber-400 text-amber-200" : "border-red-500 text-red-300"}`} />
+              {!pitFn && <div className="text-[11px] text-red-400 mt-1">formule invalide → hauteur de la grille</div>}
+              <div className="text-[10px] font-mono text-neutral-600 mt-1">ex : 1 + 0.14*cos(2*pi*t*rot) (Doppler du tournoiement)</div>
+            </div>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-4">
+            <div className="w-40"><Slider label="rot (Hz)" value={rot} min={0.02} max={3} step={0.02} onChange={setRot} fmt={(v) => v.toFixed(2) + " Hz"} /></div>
+            <p className="text-[11px] text-neutral-500 leading-relaxed flex-1 min-w-[220px]">
+              Variables : <span className="font-mono text-neutral-300">t</span> temps (s) · <span className="font-mono text-neutral-300">s</span> pas (0-15) · <span className="font-mono text-neutral-300">i</span> grain · <span className="font-mono text-neutral-300">b</span> bande · <span className="font-mono text-neutral-300">rot</span> curseur · <span className="font-mono text-neutral-300">pi</span>, <span className="font-mono text-neutral-300">e</span> · <span className="font-mono text-neutral-300">rnd()</span> · sin, cos, tan, abs, sqrt, floor, round, pow, min, max, exp, log.
+              Les pads ajoutent une seconde couche : chaque bande sa propre équation de hauteur.
+            </p>
+          </div>
+        </div>
+
+        <footer className="text-[11px] text-neutral-600 pb-4">
+          Prototype Web Audio. Les mêmes algorithmes existent en greffon LV2 natif (Granuform) pour Ardour : nuage de grains à enveloppe de Hann, rotation avec Doppler, granularisation stéréo indépendante, vibrato et glissando échantillon par échantillon.
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+const rootEl = document.getElementById("root");
+const root = ReactDOM.createRoot(rootEl);
+root.render(<App />);
+</script>
+</body>
+</html>
